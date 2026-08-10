@@ -95,7 +95,7 @@ activate_zram_swap() {
 	# Swapping to HDDs is stupid so switch to settings made for flash memory and zram/zswap
 	echo 0 > /proc/sys/vm/page-cluster
 
-	printf "\n### Activated %s %s zram swap devices with %dMB each.\n" "${zram_devices}" "${swap_algo}" "$((mem_per_zram_device / 1048576))" >> ${Log}
+	printf "### Activated %s %s zram swap devices with %dMB each." "${zram_devices}" "${swap_algo}" "$((mem_per_zram_device / 1048576))" >> ${Log}
 } # activate_zram_swap
 
 activate_ramlog_partition() {
@@ -103,8 +103,10 @@ activate_ramlog_partition() {
 	# ENABLED=true in /etc/default/armbian-ramlog is set
 	ENABLED=$(awk -F"=" '/^ENABLED/ {print $2}' /etc/default/armbian-ramlog)
 	[[ "$ENABLED" != "true" ]] && return
+
 	log_device=$(zramctl -f |sed 's/\/dev\///')
-	[[ ! ${log_device} =~ ^zram ]] && printf "\n### No more available zram devices (%s)\n" "${log_device}" >> ${Log} && exit 1;
+	[[ ! ${log_device} =~ ^zram ]] && printf "\n### No more available zram devices (%s)" "${log_device}" >> ${Log} && exit 1;
+    printf "\n### Activating compressed ramlog partition on %s" "${log_device}" >> ${Log}
 
 	# read size also from /etc/default/armbian-ramlog
 	ramlogsize=$(awk -F"=" '/^SIZE/ {print $2}' /etc/default/armbian-ramlog)
@@ -135,23 +137,41 @@ activate_ramlog_partition() {
 	fi
 
 	algo=$(sed 's/.*\[\([^]]*\)\].*/\1/g' </sys/block/${log_device}/comp_algorithm)
-	printf "### Activated Armbian ramlog partition with %s compression\n" "${algo}" >> ${Log}
+	printf "\n### Activated %s compressed ramlog partition on /dev/%s" "${algo}" "${log_device}" >> ${Log}
 } # activate_ramlog_partition
 
 activate_compressed_tmp() {
 	# create /tmp not as tmpfs but zram compressed if no fstab entry exists
-	grep -qE '^[^#[:space:]][^[:space:]]*[[:space:]]+/tmp[[:space:]]' /etc/mtab && return
-	tmp_device=$(zramctl -f |sed 's/\/dev\///')
-	[[ ! ${tmp_device} =~ ^zram ]] && printf "\n### No more available zram devices (%s)\n" "${tmp_device}" >> ${Log} && exit 1;
+	# dont forget to disable debian tmpfs mount if you want to use this feature
+    # systemctl mask tmp.mount
+	ENABLED=$(awk -F"=" '/^ENABLED/ {print $2}' /etc/default/armbian-zram-config)
+    [[ "$ENABLED" != "true" ]] && return
+    grep -qE '^[^#[:space:]][^[:space:]]*[[:space:]]+/tmp[[:space:]]' /etc/mtab && return
 
-	if [[ -f /sys/block/${tmp_device}/comp_algorithm ]]; then
-		if [ "X${TMP_ALGORITHM}" = "X" ]; then
-			echo ${swap_algo} >/sys/block/${tmp_device}/comp_algorithm 2>/dev/null
-		else
-			echo ${TMP_ALGORITHM} >/sys/block/${tmp_device}/comp_algorithm 2>/dev/null
-		fi
+    tmp_device=$(zramctl -f |sed 's/\/dev\///')
+    [[ ! ${tmp_device} =~ ^zram ]] && printf "\n### No more available zram devices (%s)" "${tmp_device}" >> ${Log} && exit 1;
+    printf "\n### Activating compressed /tmp on %s" "${tmp_device}" >> ${Log}
+
+	# use TMP_SIZE from /etc/default/armbian-zram-config
+	# default to 1/2 of the total physical memory if not defined
+	[[ -z ${TMP_SIZE} ]] && echo -n $(( memory_total / 2)) > /sys/block/${tmp_device}/disksize || echo -n ${TMP_SIZE} > /sys/block/${tmp_device}/disksize
+
+	# Use TMP_ALGORITHM if defined
+	# otherwise try to choose the most efficient compression scheme available.
+	# See https://patchwork.kernel.org/patch/9918897/
+	if [ "X${TMP_ALGORITHM}" = "X" ]; then
+		for algo in lz4 lz4hc quicklz zlib brotli zstd ; do
+			echo ${algo} >/sys/block/${tmp_device}/comp_algorithm 2>/dev/null
+		done
+	else
+		echo ${TMP_ALGORITHM} >/sys/block/${tmp_device}/comp_algorithm 2>/dev/null
 	fi
-	[[ -z ${TMP_SIZE} ]] && echo -n $(( memory_total / 2 )) > /sys/block/${tmp_device}/disksize || echo -n ${TMP_SIZE} > /sys/block/${tmp_device}/disksize
+
+	# if it fails, select $swap_algo. Workaround for some older kernels
+	if [[ $? == 1 ]]; then
+		echo ${swap_algo} > /sys/block/${tmp_device}/comp_algorithm 2>/dev/null
+	fi
+
 	if dpkg --compare-versions "$MKFS_VERSION" gt "2.40.1"; then
 		mkfs.ext4 -O ^has_journal -L tmp /dev/${tmp_device}
 	else
@@ -160,8 +180,8 @@ activate_compressed_tmp() {
 
 	mount -o nosuid,discard /dev/${tmp_device} /tmp
 	chmod 1777 /tmp
-	algo=$(sed 's/.*\[\([^]]*\)\].*/\1/g' </sys/block/${tmp_device}/comp_algorithm)
-	printf "\n### Activated %s compressed /tmp\n" "${algo}" >> ${Log}
+	tmp_algo=$(sed 's/.*\[\([^]]*\)\].*/\1/g' </sys/block/${tmp_device}/comp_algorithm)
+	printf "\n### Activated %s compressed /tmp on /dev/%s" "${tmp_algo}" "${tmp_device}">> ${Log}
 } # activate_compressed_tmp
 
 case $1 in
